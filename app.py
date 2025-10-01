@@ -1,13 +1,15 @@
 # app.py
-# Dashboard CSAT Mensal — Streamlit + Plotly (XLSX com esquema fixo por arquivo) com Persistência em Disco
-# Lê a planilha "Resultado da consulta" de cada arquivo .xlsx com nomes padronizados:
-#  - _data_product__csat_*.xlsx
-#  - _data_product__media_csat_*.xlsx
-#  - tempo_medio_de_atendimento_*.xlsx
-#  - tempo_medio_de_espera_*.xlsx
-#  - total_de_atendimentos_*.xlsx
-#  - total_de_atendimentos_concluidos_*.xlsx
-#  - tempo_medio_de_atendimento_por_canal_*.xlsx (opcional)
+# Dashboard CSAT Mensal — Streamlit + Plotly (XLSX com esquema fixo por arquivo)
+# Persistência durável no GitHub (via PyGithub) + fallback local em data_store/
+#
+# Arquivos esperados por mês (aba "Resultado da consulta"):
+#  - _data_product__csat_*.xlsx                       (Categoria, score_total)
+#  - _data_product__media_csat_*.xlsx                 (avg)
+#  - tempo_medio_de_atendimento_*.xlsx                (mean_total HH:MM:SS; pode exceder 24h)
+#  - tempo_medio_de_espera_*.xlsx                     (mean_total HH:MM:SS)
+#  - total_de_atendimentos_*.xlsx                     (total_tickets)
+#  - total_de_atendimentos_concluidos_*.xlsx          (total_tickets)
+#  - tempo_medio_de_atendimento_por_canal_*.xlsx      (opcional: Canal, ..., Média CSAT)
 
 import streamlit as st
 import pandas as pd
@@ -16,32 +18,167 @@ import plotly.express as px
 import re
 import os
 import shutil
+import base64
 from io import BytesIO
 from zipfile import ZipFile
 from datetime import datetime
 
-# ----------------------------
-# Configurações gerais
-# ----------------------------
-st.set_page_config(page_title="CSAT Dashboard (Mensal XLSX)", layout="wide")
+# ---------- GitHub (persistência durável) ----------
+# Configure em Secrets:
+# GH_TOKEN, GH_REPO ("usuario/repositorio"), GH_PATH ("data"), GH_BRANCH ("main")
+# GH_COMMITS_AUTHOR="Nome <email>" OU GH_COMMITS_NAME/ GH_COMMITS_EMAIL
 
-# Diretório de persistência
-DATA_DIR = "data_store"  # onde salvamos/lemos os CSVs padronizados por mês/tipo
+try:
+    from github import Github, GithubException, InputGitAuthor
+    GITHUB_AVAILABLE = True
+except Exception:
+    GITHUB_AVAILABLE = False
 
-# SLA / Metas (ajuste se quiser)
+def _github_client():
+    if not GITHUB_AVAILABLE:
+        return None
+    token = st.secrets.get("GH_TOKEN")
+    if not token:
+        return None
+    try:
+        return Github(token)
+    except Exception:
+        return None
+
+def _github_repo():
+    gh = _github_client()
+    if not gh:
+        return None
+    repo_name = st.secrets.get("GH_REPO")
+    if not repo_name:
+        return None
+    try:
+        return gh.get_repo(repo_name)
+    except Exception:
+        return None
+
+def _git_author():
+    """Constroi um InputGitAuthor a partir dos secrets."""
+    author_str = st.secrets.get("GH_COMMITS_AUTHOR", "")
+    name = st.secrets.get("GH_COMMITS_NAME", "")
+    email = st.secrets.get("GH_COMMITS_EMAIL", "")
+
+    if (not name or not email) and author_str and "<" in author_str and ">" in author_str:
+        try:
+            n, e = author_str.split("<", 1)
+            name = n.strip()
+            email = e.replace(">", "").strip()
+        except Exception:
+            pass
+
+    if not name:
+        name = "Streamlit Bot"
+    if not email:
+        email = "bot@example.com"
+
+    return InputGitAuthor(name, email)
+
+def gh_path_for(mkey: str, ftype: str) -> str:
+    base = st.secrets.get("GH_PATH", "data")
+    return f"{base}/{mkey}/{ftype}.csv"
+
+def save_month_to_github(mkey: str, raw_month_data: dict) -> bool:
+    """Converte datasets do mês em CSV limpos e salva/atualiza no GitHub."""
+    repo = _github_repo()
+    if not repo:
+        return False
+    cleaned = validate_and_clean(raw_month_data)
+    branch = st.secrets.get("GH_BRANCH", "main")
+    author = _git_author()
+
+    for t, df in cleaned.items():
+        path = gh_path_for(mkey, t)
+        content = df.to_csv(index=False)
+        message_update = f"update {path}"
+        message_create = f"create {path}"
+
+        try:
+            # Existe? -> update
+            file = repo.get_contents(path, ref=branch)
+            repo.update_file(
+                path, message_update, content, file.sha,
+                branch=branch, author=author, committer=author
+            )
+        except GithubException as ge:
+            if ge.status == 404:
+                # Não existe? -> create
+                repo.create_file(
+                    path, message_create, content,
+                    branch=branch, author=author, committer=author
+                )
+            else:
+                st.error(f"[GitHub] Falha ao salvar {path}: {ge}")
+                return False
+        except Exception as e:
+            st.error(f"[GitHub] Erro ao salvar {path}: {e}")
+            return False
+    return True
+
+def load_all_from_github() -> dict:
+    """Lê todos os CSVs em GH_REPO/GH_PATH e reconstrói {mes:{tipo:df}}."""
+    repo = _github_repo()
+    if not repo:
+        return {}
+    branch = st.secrets.get("GH_BRANCH", "main")
+    base = st.secrets.get("GH_PATH", "data")
+    result = {}
+    try:
+        months = repo.get_contents(base, ref=branch)
+    except GithubException as ge:
+        if ge.status == 404:
+            return {}
+        st.warning(f"[GitHub] Não consegui listar {base}: {ge}")
+        return {}
+    except Exception as e:
+        st.warning(f"[GitHub] Erro ao listar {base}: {e}")
+        return {}
+
+    for mdir in months:
+        if getattr(mdir, "type", None) != "dir":
+            continue
+        mkey = mdir.name  # ex.: 2025-02
+        result[mkey] = {}
+        try:
+            files = repo.get_contents(mdir.path, ref=branch)
+        except Exception as e:
+            st.warning(f"[GitHub] Falha ao listar {mdir.path}: {e}")
+            continue
+        for f in files:
+            if getattr(f, "type", None) != "file" or not f.name.endswith(".csv"):
+                continue
+            ftype = f.name[:-4]
+            try:
+                blob = repo.get_git_blob(f.sha)
+                csv_bytes = base64.b64decode(blob.content)
+                df = pd.read_csv(BytesIO(csv_bytes))
+                result[mkey][ftype] = df
+            except Exception as e:
+                st.warning(f"[GitHub] Falha ao ler {f.path}: {e}")
+    return result
+
+# ---------- Configurações gerais do app ----------
+st.set_page_config(page_title="CSAT Dashboard (Mensal XLSX) — GitHub Persist", layout="wide")
+
+# Persistência local (fallback) em CSVs:
+DATA_DIR = "data_store"
+
 SLA = {
     "WAITING_TIME_MAX_SECONDS": 24 * 3600,  # < 24 horas
     "CSAT_MIN": 4.0,                        # >= 4.0
     "COMPLETION_RATE_MIN": 90.0,            # > 90%
     "EVAL_COVERAGE_MIN": 75.0,              # >= 75%
-    "NEAR_RATIO": 0.05                      # margem ±5% p/ "amarelo"
+    "NEAR_RATIO": 0.05                      # margem ±5% (amarelo)
 }
 
 CSAT_ORDER = [
     "Muito Insatisfeito", "Insatisfeito", "Neutro", "Satisfeito", "Muito Satisfeito"
 ]
 
-# Padrões de arquivo (XLSX) — com timestamp depois do prefixo
 FILE_PATTERNS = {
     "csat_by_cat": r"^_data_product__csat_.*\.xlsx$",
     "csat_avg": r"^_data_product__media_csat_.*\.xlsx$",
@@ -74,21 +211,19 @@ EXPECTED_SCHEMAS = {
 
 RESULT_SHEET = "Resultado da consulta"
 
-# ----------------------------
-# Helpers
-# ----------------------------
+# ---------- Helpers ----------
 def init_state():
     if "data" not in st.session_state:
-        # {"YYYY-MM": {"csat_by_cat": df, ...}}
-        st.session_state.data = {}
-    if "autosave" not in st.session_state:
-        st.session_state.autosave = True
+        st.session_state.data = {}   # {"YYYY-MM": {"csat_by_cat": df, ...}}
+    if "autosave_local" not in st.session_state:
+        st.session_state.autosave_local = True
+    if "autosave_github" not in st.session_state:
+        st.session_state.autosave_github = True
 
 def month_key(year, month):
     return f"{int(year):04d}-{int(month):02d}"
 
 def hhmmss_to_seconds(s: str) -> int:
-    """Aceita horas > 24 (ex.: 533:44:14)."""
     if pd.isna(s):
         return 0
     s = str(s).strip()
@@ -120,7 +255,6 @@ def classify_filename(filename: str) -> str:
     return "unknown"
 
 def read_excel_result_sheet(uploaded_file) -> pd.DataFrame:
-    """Tenta ler a aba 'Resultado da consulta'; se não existir, tenta a primeira."""
     try:
         return pd.read_excel(uploaded_file, sheet_name=RESULT_SHEET, engine="openpyxl")
     except Exception:
@@ -131,7 +265,6 @@ def read_excel_result_sheet(uploaded_file) -> pd.DataFrame:
             return pd.DataFrame()
 
 def ensure_schema(df: pd.DataFrame, expected_cols: set, file_label: str) -> pd.DataFrame:
-    """Normaliza nomes (trim) e valida colunas. Retorna df (ou vazio) e alerta se divergente."""
     if df.empty:
         st.warning(f"{file_label}: planilha vazia.")
         return df
@@ -154,7 +287,6 @@ def ensure_csat_order(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 def validate_and_clean(month_data: dict) -> dict:
-    """Valida colunas por tipo, faz coerção e prepara dados."""
     cleaned = {}
     # 1) CSAT por categoria
     if "csat_by_cat" in month_data:
@@ -271,9 +403,7 @@ def sla_flags(kpis: dict):
         flags["coverage"] = (ok, warn)
     return flags
 
-# ----------------------------
-# Persistência em disco (CSV padronizado)
-# ----------------------------
+# ---------- Persistência local (fallback) ----------
 def ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -281,7 +411,6 @@ def month_dir(mkey: str) -> str:
     return os.path.join(DATA_DIR, mkey)
 
 def save_month_to_disk(mkey: str, raw_month_data: dict):
-    """Salva dados do mês em CSVs padronizados (limpos) na pasta data_store/AAAA-MM/."""
     ensure_data_dir()
     os.makedirs(month_dir(mkey), exist_ok=True)
     cleaned = validate_and_clean(raw_month_data)
@@ -290,13 +419,11 @@ def save_month_to_disk(mkey: str, raw_month_data: dict):
         df.to_csv(path, index=False)
 
 def delete_month_from_disk(mkey: str):
-    """Apaga a pasta do mês do cofre."""
     p = month_dir(mkey)
     if os.path.isdir(p):
         shutil.rmtree(p)
 
 def load_all_from_disk() -> dict:
-    """Lê toda a base persistida em data_store/ e devolve o dicionário {mes: {tipo: df}}."""
     ensure_data_dir()
     result = {}
     for mkey in sorted(os.listdir(DATA_DIR)):
@@ -306,7 +433,7 @@ def load_all_from_disk() -> dict:
         result[mkey] = {}
         for fname in os.listdir(p):
             if fname.endswith(".csv"):
-                ftype = fname[:-4]  # remove .csv
+                ftype = fname[:-4]
                 fpath = os.path.join(p, fname)
                 try:
                     df = pd.read_csv(fpath)
@@ -316,36 +443,29 @@ def load_all_from_disk() -> dict:
     return result
 
 def replace_single_file(mkey: str, ftype: str, uploaded_xlsx):
-    """Substitui só um tipo de arquivo para um mês, revalidando e salvando no cofre."""
-    # Carrega o raw atual do mês (a partir do disco, se existir)
-    current = {}
-    # tenta ler o que já tem salvo
-    disk = load_all_from_disk()
-    if mkey in disk:
-        current = disk[mkey]
-
-    # Lê xlsx novo
-    df_new = read_excel_result_sheet(uploaded_xlsx)
-
-    # Monta "raw" compatível (chaves/ftype -> df bruto)
+    """Substitui um tipo específico para um mês (em memória + salva em GH/disk)."""
     raw = {}
-    for t in current.keys():
-        raw[t] = current[t]
-    # cuidado: current[t] veio de CSV limpo (já padronizado)
-    # vamos sobrescrever somente o ftype com o excel recém-carregado (a limpeza ocorre no save_month_to_disk)
+    if mkey in st.session_state.data:
+        for t, df in st.session_state.data[mkey].items():
+            raw[t] = df
+    df_new = read_excel_result_sheet(uploaded_xlsx)
     raw[ftype] = df_new
-
-    # Salva no disco (em forma limpa)
     save_month_to_disk(mkey, raw)
-    return True
+    ok_gh = save_month_to_github(mkey, raw)
+    refreshed = load_all_from_github()
+    if refreshed:
+        for mk, payload in refreshed.items():
+            st.session_state.data[mk] = payload
+    else:
+        disk_now = load_all_from_disk()
+        for mk, payload in disk_now.items():
+            st.session_state.data[mk] = payload
+    return ok_gh
 
-# ----------------------------
-# Import/Export pacote .zip (continua valendo)
-# ----------------------------
+# ---------- Import/Export ZIP ----------
 def export_zip(data_dict: dict) -> BytesIO:
     buffer = BytesIO()
     with ZipFile(buffer, "w") as zf:
-        # KPIs por mês
         kpi_rows = []
         for mkey, month_data in data_dict.items():
             cleaned = validate_and_clean(month_data)
@@ -363,8 +483,6 @@ def export_zip(data_dict: dict) -> BytesIO:
             })
         kpi_df = pd.DataFrame(kpi_rows)
         zf.writestr("agregados/kpis_por_mes.csv", kpi_df.to_csv(index=False))
-
-        # Datasets limpos por mês (o que estiver em memória agora)
         for mkey, month_data in data_dict.items():
             cleaned = validate_and_clean(month_data)
             for t, df in cleaned.items():
@@ -387,30 +505,33 @@ def import_zip(file_like) -> dict:
                 result[mkey][ftype] = df
     return result
 
-# ----------------------------
-# UI — Sidebar
-# ----------------------------
+# ---------- UI ----------
 init_state()
 
-# 0) Carregar do disco ao iniciar
-disk_data = load_all_from_disk()
-# Merge: dados do disco prevalecem como base inicial
-for mk, payload in disk_data.items():
-    st.session_state.data[mk] = payload
+# 0) Carregar dados: tenta GitHub; se vazio, tenta disco local
+gh_data = load_all_from_github()
+if gh_data:
+    for mk, payload in gh_data.items():
+        st.session_state.data[mk] = payload
+else:
+    disk_data = load_all_from_disk()
+    for mk, payload in disk_data.items():
+        st.session_state.data[mk] = payload
 
 st.sidebar.title("Parâmetros do Mês")
 
 col_m, col_y = st.sidebar.columns(2)
-month = col_m.selectbox("Mês", list(range(1, 12+1)), format_func=lambda x: f"{x:02d}")
-year = col_y.selectbox("Ano", list(range(datetime.now().year - 5, datetime.now().year + 1)))
+month = col_m.selectbox("Mês", list(range(1, 13)), format_func=lambda x: f"{x:02d}")
+# ====== Anos fixos de 2025 a 2030 ======
+year = col_y.selectbox("Ano", list(range(2025, 2031)))
 current_month_key = month_key(year, month)
 
-st.sidebar.checkbox("Salvar automaticamente no cofre (persistência)", value=True, key="autosave")
+st.sidebar.checkbox("Salvar em disco (fallback local)", value=True, key="autosave_local")
+st.sidebar.checkbox("Salvar no GitHub (persistência durável)", value=True, key="autosave_github")
 
 st.sidebar.markdown("### Upload dos arquivos (.xlsx)")
-st.sidebar.caption("Cada arquivo deve conter a aba 'Resultado da consulta'.")
+st.sidebar.caption('Cada arquivo deve conter a aba "Resultado da consulta".')
 
-# Uploaders individuais (nomes e conteúdos específicos)
 u_csat_by_cat = st.sidebar.file_uploader("1) _data_product__csat_*.xlsx  (Categoria, score_total)", type=["xlsx"], key="u_csat_by_cat")
 u_csat_avg = st.sidebar.file_uploader("2) _data_product__media_csat_*.xlsx  (avg)", type=["xlsx"], key="u_csat_avg")
 u_handle_avg = st.sidebar.file_uploader("3) tempo_medio_de_atendimento_*.xlsx  (mean_total HH:MM:SS)", type=["xlsx"], key="u_handle_avg")
@@ -422,43 +543,53 @@ u_by_channel = st.sidebar.file_uploader("7) tempo_medio_de_atendimento_por_canal
 st.sidebar.markdown("— ou arraste vários de uma vez —")
 multi = st.sidebar.file_uploader("Upload múltiplo (classificação automática por nome)", type=["xlsx"], accept_multiple_files=True, key="multi_all")
 
+def _ingest_to_session(mkey: str, fileobj, expected_type: str):
+    if not fileobj:
+        return
+    if not re.match(FILE_PATTERNS[expected_type], fileobj.name, flags=re.IGNORECASE):
+        st.warning(f"Nome não bate com o padrão esperado para {expected_type}: {fileobj.name}")
+    df = read_excel_result_sheet(fileobj)
+    if mkey not in st.session_state.data:
+        st.session_state.data[mkey] = {}
+    st.session_state.data[mkey][expected_type] = df
+
 if st.sidebar.button("Salvar arquivos do mês atual"):
-    if current_month_key not in st.session_state.data:
-        st.session_state.data[current_month_key] = {}
-
-    # Processar uploads individuais
-    def _ingest(fileobj, expected_type):
-        if not fileobj:
-            return
-        if not re.match(FILE_PATTERNS[expected_type], fileobj.name, flags=re.IGNORECASE):
-            st.warning(f"Nome não bate com o padrão esperado para {expected_type}: {fileobj.name}")
-        df = read_excel_result_sheet(fileobj)
-        st.session_state.data[current_month_key][expected_type] = df
-
-    _ingest(u_csat_by_cat, "csat_by_cat")
-    _ingest(u_csat_avg, "csat_avg")
-    _ingest(u_handle_avg, "handle_avg")
-    _ingest(u_wait_avg, "wait_avg")
-    _ingest(u_total, "total")
-    _ingest(u_completed, "completed")
+    _ingest_to_session(current_month_key, u_csat_by_cat, "csat_by_cat")
+    _ingest_to_session(current_month_key, u_csat_avg, "csat_avg")
+    _ingest_to_session(current_month_key, u_handle_avg, "handle_avg")
+    _ingest_to_session(current_month_key, u_wait_avg, "wait_avg")
+    _ingest_to_session(current_month_key, u_total, "total")
+    _ingest_to_session(current_month_key, u_completed, "completed")
     if u_by_channel:
-        _ingest(u_by_channel, "by_channel")
+        _ingest_to_session(current_month_key, u_by_channel, "by_channel")
 
-    # Multi-upload
     for f in multi or []:
         ftype = classify_filename(f.name)
         if ftype == "unknown":
             st.warning(f"Arquivo ignorado (nome não reconhecido): {f.name}")
             continue
         df = read_excel_result_sheet(f)
+        if current_month_key not in st.session_state.data:
+            st.session_state.data[current_month_key] = {}
         st.session_state.data[current_month_key][ftype] = df
 
-    st.success(f"Arquivos anexados e salvos para {current_month_key} (memória).")
+    st.success(f"Arquivos anexados em memória para {current_month_key}.")
 
-    # Salvar no cofre (disco)
-    if st.session_state.autosave:
+    # Persistir conforme flags
+    saved_local = False
+    saved_gh = False
+    if st.session_state.autosave_local:
         save_month_to_disk(current_month_key, st.session_state.data[current_month_key])
-        st.success(f"Persistência OK: dados gravados em {DATA_DIR}/{current_month_key}/")
+        saved_local = True
+    if st.session_state.autosave_github:
+        saved_gh = save_month_to_github(current_month_key, st.session_state.data[current_month_key])
+
+    if saved_local:
+        st.success(f"[DISCO] Dados gravados em data_store/{current_month_key}/")
+    if saved_gh:
+        st.success(f"[GITHUB] Dados persistidos em {st.secrets.get('GH_REPO','<repo>')}/{st.secrets.get('GH_PATH','data')}/{current_month_key}/")
+    if st.session_state.autosave_github and not saved_gh:
+        st.warning("Falha ao salvar no GitHub (verifique os secrets).")
 
 # Import/Export pacote
 st.sidebar.markdown("---")
@@ -477,56 +608,56 @@ if imp_file is not None:
         restored = import_zip(imp_file)
         for k, v in restored.items():
             st.session_state.data[k] = v
-            # grava no disco também
-            save_month_to_disk(k, v)
+            if st.session_state.autosave_local:
+                save_month_to_disk(k, v)
+            if st.session_state.autosave_github:
+                save_month_to_github(k, v)
         st.success("Pacote importado e persistido com sucesso.")
     except Exception as e:
         st.error(f"Falha ao importar pacote: {e}")
 
-# Utilidades de manutenção
+# Manutenção (trocar arquivo / apagar mês)
 st.sidebar.markdown("---")
-st.sidebar.subheader("Manutenção do Cofre")
+st.sidebar.subheader("Manutenção")
 
-# Trocar arquivo de um tipo (por mês)
-all_months = sorted(st.session_state.data.keys() | set(os.listdir(DATA_DIR) if os.path.isdir(DATA_DIR) else []))
-sel_m = st.sidebar.selectbox("Mês para trocar arquivo", all_months if all_months else ["(nenhum)"])
+# Conjunto de meses: sessão + disco + GitHub
+all_months = set(st.session_state.data.keys())
+if os.path.isdir(DATA_DIR):
+    all_months |= set(os.listdir(DATA_DIR))
+gh_loaded = load_all_from_github()
+all_months |= set(gh_loaded.keys())
+all_months = sorted(all_months)
+
+sel_m = st.sidebar.selectbox("Mês para trocar arquivo", ["(nenhum)"] + all_months)
 sel_t = st.sidebar.selectbox("Tipo de arquivo", REQUIRED_TYPES + OPTIONAL_TYPES)
-file_replace = st.sidebar.file_uploader("Novo .xlsx para substituir esse tipo", type=["xlsx"], key="replace_one")
+file_replace = st.sidebar.file_uploader("Novo .xlsx para esse tipo", type=["xlsx"], key="replace_one")
 
 if st.sidebar.button("Trocar este arquivo"):
     if sel_m == "(nenhum)" or not file_replace:
         st.warning("Selecione um mês e envie um arquivo.")
     else:
-        try:
-            replace_single_file(sel_m, sel_t, file_replace)
-            # refletir na sessão
-            disk_now = load_all_from_disk()
-            for mk, payload in disk_now.items():
-                st.session_state.data[mk] = payload
-            st.success(f"Arquivo '{sel_t}' de {sel_m} substituído e persistido.")
-        except Exception as e:
-            st.error(f"Falha ao substituir: {e}")
+        ok_gh = replace_single_file(sel_m, sel_t, file_replace)
+        if ok_gh:
+            st.success(f"Arquivo '{sel_t}' de {sel_m} substituído (GitHub + disco).")
+        else:
+            st.warning("Substituído localmente; GitHub falhou (verifique secrets).")
 
-# Apagar mês
-del_m = st.sidebar.selectbox("Apagar mês do cofre", all_months if all_months else ["(nenhum)"], key="del_m")
-if st.sidebar.button("Apagar mês"):
+del_m = st.sidebar.selectbox("Apagar mês (local)", ["(nenhum)"] + all_months, key="del_m")
+if st.sidebar.button("Apagar mês local"):
     if del_m == "(nenhum)":
         st.warning("Selecione um mês.")
     else:
         delete_month_from_disk(del_m)
-        # Limpa da sessão também
         if del_m in st.session_state.data:
             del st.session_state.data[del_m]
-        st.success(f"Mês {del_m} removido do cofre.")
+        st.success(f"Mês {del_m} removido do cofre local.")
 
 st.sidebar.markdown("---")
 normalize_pct = st.sidebar.checkbox("Normalizar distribuição CSAT (percentual)", value=True)
 
-# ----------------------------
-# Conteúdo principal
-# ----------------------------
-st.title("Dashboard CSAT Mensal (XLSX) — com Persistência")
-st.caption("Arquivos por mês ficam salvos em data_store/. Você pode substituir arquivos específicos sem refazer tudo.")
+# ---------- Conteúdo principal ----------
+st.title("Dashboard CSAT Mensal (XLSX) — Persistência GitHub")
+st.caption("Arquivos por mês ficam salvos no repositório GitHub configurado (e em data_store/ como fallback).")
 
 tabs = st.tabs(["Visão Geral", "Por Canal", "Comparativo Mensal", "Dicionário de Dados"])
 
@@ -534,11 +665,10 @@ tabs = st.tabs(["Visão Geral", "Por Canal", "Comparativo Mensal", "Dicionário 
 with tabs[0]:
     st.subheader(f"Mês selecionado: {current_month_key}")
     if current_month_key not in st.session_state.data:
-        st.info("Nenhum dado carregado para este mês. Faça upload na barra lateral, salve e (opcional) persista.")
+        st.info("Nenhum dado carregado para este mês. Faça upload na barra lateral e clique em 'Salvar arquivos do mês atual'.")
     else:
         raw = st.session_state.data[current_month_key]
         cleaned = validate_and_clean(raw)
-
         for req in REQUIRED_TYPES:
             if req not in cleaned:
                 st.warning(f"Arquivo obrigatório ausente em {current_month_key}: {req}")
@@ -565,16 +695,13 @@ with tabs[0]:
         c4.metric("Tempo médio de atendimento", seconds_to_hhmmss(ht))
 
         w_ok, w_warn = flags.get("wait",(False,False)) if "wait" in flags else (False,False)
-        wait_icon = color_flag(w_ok, w_warn)
-        c5.metric("Tempo médio de espera", seconds_to_hhmmss(wt), help=f"SLA < 24:00:00 {wait_icon}")
+        c5.metric("Tempo médio de espera", seconds_to_hhmmss(wt), help="SLA < 24:00:00 " + ("✅" if w_ok else "⚠️" if w_warn else "❌"))
 
         cs_ok, cs_warn = flags.get("csat",(False,False)) if "csat" in flags else (False,False)
-        cs_icon = color_flag(cs_ok, cs_warn)
-        c6.metric("CSAT médio (1–5)", f"{cs:.2f}" if not pd.isna(cs) else "-", help=f"SLA ≥ {SLA['CSAT_MIN']} {cs_icon}")
+        c6.metric("CSAT médio (1–5)", f"{cs:.2f}" if not pd.isna(cs) else "-", help=f"SLA ≥ {SLA['CSAT_MIN']} " + ("✅" if cs_ok else "⚠️" if cs_warn else "❌"))
 
         cov_ok, cov_warn = flags.get("coverage",(False,False)) if "coverage" in flags else (False,False)
-        cov_icon = color_flag(cov_ok, cov_warn)
-        c7.metric("Cobertura de avaliação", f"{(f'{cov:.1f}%' if not pd.isna(cov) else '-')}", help=f"SLA ≥ {SLA['EVAL_COVERAGE_MIN']}% {cov_icon}")
+        c7.metric("Cobertura de avaliação", f"{(f'{cov:.1f}%' if not pd.isna(cov) else '-')}", help=f"SLA ≥ {SLA['EVAL_COVERAGE_MIN']}% " + ("✅" if cov_ok else "⚠️" if cov_warn else "❌"))
 
         if not pd.isna(ev) and not pd.isna(completed) and ev > completed:
             st.warning("Inconsistência: chamadas avaliadas > concluídas.")
@@ -612,33 +739,34 @@ with tabs[1]:
         st.dataframe(dfc, use_container_width=True)
         st.download_button("Baixar por canal (CSV)", data=dfc.to_csv(index=False).encode("utf-8"),
                            file_name=f"por_canal_{current_month_key}.csv")
-
         st.markdown("---")
         col1, col2 = st.columns(2)
         with col1:
-            fig1 = px.bar(dfc, x="Canal", y="Total de atendimentos", title="Total de atendimentos por canal")
-            st.plotly_chart(fig1, use_container_width=True)
+            st.plotly_chart(px.bar(dfc, x="Canal", y="Total de atendimentos", title="Total de atendimentos por canal"), use_container_width=True)
         with col2:
-            fig2 = px.bar(dfc, x="Canal", y="Total de atendimentos concluídos", title="Concluídos por canal")
-            st.plotly_chart(fig2, use_container_width=True)
-
+            st.plotly_chart(px.bar(dfc, x="Canal", y="Total de atendimentos concluídos", title="Concluídos por canal"), use_container_width=True)
         col3, col4 = st.columns(2)
         with col3:
             if "_handle_seconds" in dfc.columns:
                 dft = dfc.copy()
                 dft["Tempo médio de atendimento (s)"] = dft["_handle_seconds"]
-                fig3 = px.bar(dft, x="Canal", y="Tempo médio de atendimento (s)", title="Tempo médio de atendimento (s)")
-                st.plotly_chart(fig3, use_container_width=True)
+                st.plotly_chart(px.bar(dft, x="Canal", y="Tempo médio de atendimento (s)", title="Tempo médio de atendimento (s)"), use_container_width=True)
         with col4:
             if "_wait_seconds" in dfc.columns:
                 dft = dfc.copy()
-                dft["Tempo médio de espera (s)"] = dft["_wait_seconds"]
-                fig4 = px.bar(dft, x="Canal", y="Tempo médio de espera (s)", title="Tempo médio de espera (s)")
-                st.plotly_chart(fig4, use_container_width=True)
-
+                # --------- CONVERSÃO PARA HORAS ----------
+                dft["Tempo médio de espera (h)"] = dft["_wait_seconds"] / 3600
+                st.plotly_chart(
+                    px.bar(
+                        dft,
+                        x="Canal",
+                        y="Tempo médio de espera (h)",
+                        title="Tempo médio de espera (horas)"
+                    ),
+                    use_container_width=True
+                )
         st.markdown("---")
-        fig5 = px.bar(dfc, x="Canal", y="Média CSAT", title="CSAT médio por canal")
-        st.plotly_chart(fig5, use_container_width=True)
+        st.plotly_chart(px.bar(dfc, x="Canal", y="Média CSAT", title="CSAT médio por canal"), use_container_width=True)
 
 # 3) Comparativo Mensal
 with tabs[2]:
@@ -660,52 +788,74 @@ with tabs[2]:
                 "csat_medio": k.get("csat_avg"),
                 "cobertura_%": k.get("eval_coverage"),
             })
+
         comp = pd.DataFrame(rows).sort_values("mes")
+
+        # --------- NOVO: coluna em horas a partir dos segundos ----------
+        if "tempo_espera_s" in comp.columns:
+            comp["tempo_espera_h"] = comp["tempo_espera_s"] / 3600
+
         st.dataframe(comp, use_container_width=True)
-        st.download_button("Baixar comparativo (CSV)", data=comp.to_csv(index=False).encode("utf-8"),
-                           file_name="comparativo_mensal.csv")
+        st.download_button(
+            "Baixar comparativo (CSV)",
+            data=comp.to_csv(index=False).encode("utf-8"),
+            file_name="comparativo_mensal.csv"
+        )
 
         c1, c2 = st.columns(2)
         with c1:
-            st.plotly_chart(px.line(comp, x="mes", y="total", markers=True, title="Total de atendimentos (mensal)"), use_container_width=True)
+            st.plotly_chart(
+                px.line(comp, x="mes", y="total", markers=True, title="Total de atendimentos (mensal)"),
+                use_container_width=True
+            )
         with c2:
-            st.plotly_chart(px.line(comp, x="mes", y="taxa_conclusao", markers=True, title="Taxa de conclusão (%)"), use_container_width=True)
+            st.plotly_chart(
+                px.line(comp, x="mes", y="taxa_conclusao", markers=True, title="Taxa de conclusão (%)"),
+                use_container_width=True
+            )
+
         c3, c4 = st.columns(2)
         with c3:
-            st.plotly_chart(px.line(comp, x="mes", y="csat_medio", markers=True, title="CSAT médio (1–5)"), use_container_width=True)
+            st.plotly_chart(
+                px.line(comp, x="mes", y="csat_medio", markers=True, title="CSAT médio (1–5)"),
+                use_container_width=True
+            )
         with c4:
-            st.plotly_chart(px.line(comp, x="mes", y="tempo_espera_s", markers=True, title="Tempo médio de espera (s)"), use_container_width=True)
+            y_col = "tempo_espera_h" if "tempo_espera_h" in comp.columns else "tempo_espera_s"
+            y_title = "Tempo médio de espera (h)" if y_col == "tempo_espera_h" else "Tempo médio de espera (s)"
+            st.plotly_chart(
+                px.line(comp, x="mes", y=y_col, markers=True, title=y_title),
+                use_container_width=True
+            )
 
 # 4) Dicionário de Dados
 with tabs[3]:
     st.subheader("Dicionário de Dados")
     st.markdown(f"""
-**Arquivos .xlsx por mês (aba `"{RESULT_SHEET}"`):**
-- **`_data_product__csat_*.xlsx`** — colunas: `Categoria`, `score_total` (totais por categoria CSAT).
-- **`_data_product__media_csat_*.xlsx`** — colunas: `avg` (CSAT médio global 1–5).
-- **`tempo_medio_de_atendimento_*.xlsx`** — colunas: `mean_total` (`HH:MM:SS`, pode exceder 24h).
-- **`tempo_medio_de_espera_*.xlsx`** — colunas: `mean_total` (`HH:MM:SS`).
-- **`total_de_atendimentos_*.xlsx`** — colunas: `total_tickets` (int).
-- **`total_de_atendimentos_concluidos_*.xlsx`** — colunas: `total_tickets` (int).
-- **`tempo_medio_de_atendimento_por_canal_*.xlsx`** *(opcional)* — colunas:  
-  `Canal`, `Tempo médio de atendimento`, `Tempo médio de espera`,  
-  `Total de atendimentos`, `Total de atendimentos concluídos`, `Média CSAT`.
+**Arquivos .xlsx por mês (aba `"Resultado da consulta"`):**
+- `_data_product__csat_*.xlsx` — `Categoria`, `score_total`
+- `_data_product__media_csat_*.xlsx` — `avg` (CSAT 1–5)
+- `tempo_medio_de_atendimento_*.xlsx` — `mean_total` (`HH:MM:SS`, pode exceder 24h)
+- `tempo_medio_de_espera_*.xlsx` — `mean_total` (`HH:MM:SS`)
+- `total_de_atendimentos_*.xlsx` — `total_tickets` (int)
+- `total_de_atendimentos_concluidos_*.xlsx` — `total_tickets` (int)
+- `tempo_medio_de_atendimento_por_canal_*.xlsx` (opcional):
+  `Canal`, `Tempo médio de atendimento`, `Tempo médio de espera`,
+  `Total de atendimentos`, `Total de atendimentos concluídos`, `Média CSAT`
 
 **Métricas e fórmulas:**
-- **Total de atendimentos** — soma de `total_tickets`.
-- **Total de concluídos** — soma de `total_tickets` (concluídos).
-- **Taxa de conclusão (%)** — `concluídos/total*100`.
-- **Tempo médio de atendimento** — `mean_total` convertido de `HH:MM:SS`.
-- **Tempo médio de espera** — `mean_total` convertido de `HH:MM:SS`.
-- **CSAT médio (1–5)** — `avg`.
-- **Cobertura de avaliação (%)** — `avaliadas/concluídos*100`, onde `avaliadas = soma(score_total)`.
-- **Distribuição CSAT por categoria** — ordem: {", ".join(CSAT_ORDER)}.
+- Total: soma de `total_tickets`
+- Concluídos: soma de `total_tickets` (concluídos)
+- Taxa de conclusão (%) = `concluídos/total*100`
+- Tempo médio de atendimento/espera: `mean_total` → segundos → formatação `HH:MM:SS`
+- CSAT médio (1–5): `avg`
+- Cobertura de avaliação (%) = `avaliadas/concluídos*100`, `avaliadas = soma(score_total)`
+- Ordem CSAT: {", ".join(CSAT_ORDER)}
 
 **SLAs:**
-- Espera média `< 24h`; CSAT `≥ 4.0`; Conclusão `> 90%`; Cobertura `≥ 75%`.
+- Espera `< 24h`; CSAT `≥ 4.0`; Conclusão `> 90%`; Cobertura `≥ 75%`
 
 **Persistência:**
-- Dados salvos em **{DATA_DIR}/AAAA-MM/**, um CSV por tipo (após limpeza).
-- Use **“Trocar arquivo de um tipo”** para substituir apenas um dataset de um mês.
-- **Exportar/Importar .zip** para backup externo.
+- GitHub (recomendado) via `GH_TOKEN`/`GH_REPO`/`GH_PATH`/`GH_BRANCH`
+- Fallback local em `data_store/AAAA-MM/*.csv`
 """)
