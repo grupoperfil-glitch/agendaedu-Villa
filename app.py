@@ -1,5 +1,5 @@
-# app.py — Dashboard CSAT Mensal (Colégio Perfil)
-# Versão simplificada focada APENAS no Colégio Perfil.
+# app.py — Dashboard CSAT Mensal (Escola Villa Criar)
+# Versão simplificada focada APENAS na Escola Villa Criar.
 # Não usa config.json e fixa o caminho dos dados.
 # ATUALIZADO com a nova aba "Comparativo Mensal Por Canal".
 
@@ -17,10 +17,10 @@ from datetime import date
 
 # ====================== CONFIG ======================
 # --- CONFIGURAÇÃO FIXA (HARDCODED) ---
-# Como este app é APENAS para o Colégio Perfil,
+# Como este app é APENAS para a Escola Villa Criar,
 # fixamos o caminho dos dados aqui.
-EMPRESA_PATH_FIXO = "data" 
-EMPRESA_NOME_FIXO = "Colégio Perfil"
+EMPRESA_PATH_FIXO = "datavilla" 
+EMPRESA_NOME_FIXO = "Escola Villa Criar"
 
 # Mapeia os tipos para os padrões Regex
 # Adiciona o operador | (OU) para aceitar os nomes de arquivo
