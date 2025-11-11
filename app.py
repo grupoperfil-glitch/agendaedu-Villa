@@ -1,6 +1,7 @@
-# app.py — Dashboard CSAT Mensal (Escola Villa Criar)
-# Versão simplificada focada APENAS na Escola Villa Criar.
+# app.py — Dashboard CSAT Mensal (Colégio Perfil)
+# Versão simplificada focada APENAS no Colégio Perfil.
 # Não usa config.json e fixa o caminho dos dados.
+# ATUALIZADO com a nova aba "Comparativo Mensal Por Canal".
 
 import streamlit as st
 import pandas as pd
@@ -16,13 +17,12 @@ from datetime import date
 
 # ====================== CONFIG ======================
 # --- CONFIGURAÇÃO FIXA (HARDCODED) ---
-# Como este app é APENAS para a Escola Villa Criar,
+# Como este app é APENAS para o Colégio Perfil,
 # fixamos o caminho dos dados aqui.
-EMPRESA_PATH_FIXO = "datavilla" 
-EMPRESA_NOME_FIXO = "Escola Villa Criar"
+EMPRESA_PATH_FIXO = "data" 
+EMPRESA_NOME_FIXO = "Colégio Perfil"
 
 # Mapeia os tipos para os padrões Regex
-# --- INÍCIO DA ALTERAÇÃO (Regex Flexível v2) ---
 # Adiciona o operador | (OU) para aceitar os nomes de arquivo
 # antigos (ex: total.csv) OU os nomes novos (ex: total_de_atendimentos...csv)
 FILE_PATTERNS = {
@@ -34,7 +34,6 @@ FILE_PATTERNS = {
     "concluidos": r"^(total_de_atendimentos_concluidos(_.*)?|completed)\.csv$",
     "por_canal": r"^(tempo_medio_de_atendimento_por_canal(_.*)?|by_channel)\.csv$",
 }
-# --- FIM DA ALTERAÇÃO ---
 
 # Metas de SLA
 SLA = {
@@ -439,11 +438,6 @@ def get_all_kpis() -> pd.DataFrame:
     
     for mkey in month_keys[:12]: # Limita a 12 meses
         try:
-            # --- IMPORTANTE: Limpa o cache da função de leitura ---
-            # para garantir que os dados de debug não sejam cacheados.
-            # (Removido na versão final, mas importante para debug)
-            # load_data_from_github.clear() # Desativado para performance
-            
             raw_data = load_data_from_github(mkey) # Não precisa mais de empresa_path
             if not raw_data:
                 continue
@@ -472,6 +466,102 @@ def get_all_kpis() -> pd.DataFrame:
             
     comp = pd.DataFrame(rows).sort_values("mes")
     return comp
+
+# --- INÍCIO DA NOVA FUNÇÃO ---
+@st.cache_data(ttl=3600) # Cache de 1 hora
+def get_all_channel_data() -> pd.DataFrame:
+    """
+    Busca dados de TODOS os meses e TODOS os canais para a nova aba.
+    Usa o EMPRESA_PATH_FIXO.
+    """
+    try:
+        token = st.secrets["GH_TOKEN"]
+        repo_name = st.secrets["GH_REPO"]
+        branch = st.secrets["GH_BRANCH"]
+    except KeyError as e:
+        st.error(f"ERRO: Segredo do Streamlit não encontrado: {e}.")
+        return pd.DataFrame()
+
+    # 1. Listar diretórios (meses) na pasta da empresa
+    # (Exatamente como em get_all_kpis)
+    api_url = f"https://api.github.com/repos/{repo_name}/contents/{EMPRESA_PATH_FIXO}?ref={branch}"
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+    
+    try:
+        response = requests.get(api_url, headers=headers)
+        if response.status_code != 200:
+            st.error(f"Erro ao listar pastas ({api_url}): Status {response.status_code}")
+            return pd.DataFrame()
+            
+        content = response.json()
+        month_keys = sorted([
+            item['name'] for item in content 
+            if item['type'] == 'dir' and re.match(r'^\d{4}-\d{2}$', item['name'])
+        ]) # Ordenado do mais antigo para o mais novo
+        
+        if not month_keys:
+            return pd.DataFrame()
+
+    except Exception as e:
+        st.error(f"Falha ao listar meses no repositório: {e}")
+        return pd.DataFrame()
+
+    # 2. Para cada mês, carregar APENAS os dados por canal
+    all_dfs = []
+    
+    for mkey in month_keys:
+        try:
+            # Reutiliza nossa função de leitura principal
+            raw_data = load_data_from_github(mkey) 
+            
+            if "por_canal" in raw_data:
+                df = raw_data["por_canal"].copy()
+                
+                # Garante que as colunas esperadas de "por_canal" existam
+                schema = EXPECTED_SCHEMAS["por_canal"]
+                if not schema.issubset(set(df.columns)):
+                    st.warning(f"Arquivo 'por_canal' em {mkey} com esquema inválido. Pulando.")
+                    continue
+
+                df['mes'] = mkey # Adiciona a coluna 'mês'
+                all_dfs.append(df)
+            
+        except Exception as e:
+            st.warning(f"Falha ao processar dados 'por_canal' para o mês {mkey}: {e}")
+
+    if not all_dfs:
+        return pd.DataFrame()
+            
+    # 3. Concatenar e limpar os dados
+    master_df = pd.concat(all_dfs, ignore_index=True)
+    
+    # 4. Limpeza e Conversão de Tipos (essencial para os gráficos)
+    try:
+        master_df['Canal'] = master_df['Canal'].astype(str).str.strip()
+        master_df['TME_sec'] = master_df['Tempo médio de espera'].astype(str).apply(hhmmss_to_seconds)
+        master_df['TME_Horas'] = master_df['TME_sec'] / 3600
+        master_df['TA_sec'] = master_df['Tempo médio de atendimento'].astype(str).apply(hhmmss_to_seconds)
+        master_df['TA_Horas'] = master_df['TA_sec'] / 3600
+        master_df['Média CSAT'] = pd.to_numeric(master_df['Média CSAT'], errors='coerce')
+        master_df['Total de atendimentos'] = pd.to_numeric(master_df['Total de atendimentos'], errors='coerce').fillna(0)
+        master_df['Total de atendimentos concluídos'] = pd.to_numeric(master_df['Total de atendimentos concluídos'], errors='coerce').fillna(0)
+        
+        # Cálculo de % Concluídos por Canal
+        master_df['% Concluídos'] = (
+            (master_df['Total de atendimentos concluídos'] / master_df['Total de atendimentos']) * 100
+        ).fillna(0)
+        # Lida com divisão por zero (0 / 0 = NaN, que vira 0)
+        master_df.loc[master_df['Total de atendimentos'] == 0, '% Concluídos'] = 0
+
+    except Exception as e:
+        st.error(f"Falha ao limpar dados mestre de canal: {e}")
+        return pd.DataFrame()
+
+    return master_df
+# --- FIM DA NOVA FUNÇÃO ---
 
 
 def upload_to_github(file_content: bytes, mes_key: str, target_filename: str):
@@ -549,7 +639,7 @@ init_state()
 # --- 1. Seleção de Análise ---
 st.sidebar.title("Filtros de Análise")
 st.sidebar.markdown(f"**Instituição:** `{EMPRESA_NOME_FIXO}`")
-st.sidebar.caption("Versão: Prod v3 (RegEx Flexível)") # <-- Mudei a versão
+st.sidebar.caption("Versão: 4.0 (Aba Comp. Canal)") # <-- Mudei a versão
 
 # Seletores de Mês/Ano
 col_m, col_y = st.sidebar.columns(2)
@@ -597,7 +687,6 @@ with st.sidebar.expander("Upload de Novos Dados"):
     st.caption(f"Os arquivos serão enviados para: `{EMPRESA_PATH_FIXO}/{upload_month_key}/`")
 
     # Mapeia os nomes de arquivo base para os tipos (ex: "dist_csat")
-    # --- INÍCIO DA ALTERAÇÃO (RÓTULOS DE UPLOAD) ---
     # Ajusta os rótulos para refletir os nomes exatos dos arquivos.
     upload_map_config = {
         "dist_csat": "1) Distribuição CSAT (_data_product__csat_...)",
@@ -608,7 +697,6 @@ with st.sidebar.expander("Upload de Novos Dados"):
         "concluidos": "6) Atendimentos Concluídos (total_de_atendimentos_concluidos_...)",
         "por_canal": "7) Dados Por Canal (tempo_medio_de_atendimento_por_canal_...)",
     }
-    # --- FIM DA ALTERAÇÃO (RÓTULOS DE UPLOAD) ---
 
     upload_files_map = {} # Armazena {UploadedFile: target_filename}
     
@@ -666,8 +754,16 @@ except Exception as e:
     st.error(f"Falha crítica ao carregar dados do GitHub: {e}")
     raw_month_data = {}
 
-# Define as abas
-tabs = st.tabs(["Visão Geral", "Por Canal", "Comparativo Mensal", "Dicionário de Dados"])
+# --- INÍCIO DA ALTERAÇÃO (ORDEM DAS ABAS) ---
+# Define as abas na nova ordem solicitada
+tabs = st.tabs([
+    "Visão Geral", 
+    "Comparativo Mensal", 
+    "Por Canal", 
+    "Comparativo Mensal Por Canal", # <-- NOVA ABA
+    "Dicionário de Dados"
+])
+# --- FIM DA ALTERAÇÃO (ORDEM DAS ABAS) ---
 
 
 # --- 1) Visão Geral ---
@@ -748,10 +844,42 @@ with tabs[0]:
         else:
             st.warning("Arquivo de 'Distribuição do CSAT' não encontrado para o gráfico.")
 
-# --- 2) Por Canal ---
+# --- 2) Comparativo Mensal ---
+# (Este era o código da antiga tabs[2])
 with tabs[1]:
-    st.subheader("Indicadores por Canal")
+    st.subheader("Comparativo Mensal (KPIs Globais)")
     
+    with st.spinner(f"Carregando histórico de KPIs para {EMPRESA_NOME_FIXO}..."):
+        comp_df = get_all_kpis()
+    
+    if comp_df.empty:
+        st.info(f"Nenhum dado histórico encontrado para '{EMPRESA_NOME_FIXO}'. Carregue dados de pelo menos um mês.")
+    elif len(comp_df) < 2:
+        st.info("Carregue dados de pelo menos dois meses para habilitar o comparativo.")
+        st.dataframe(comp_df, use_container_width=True)
+    else:
+        if "tempo_espera_s" in comp_df.columns:
+            comp_df["tempo_espera_h"] = comp_df["tempo_espera_s"] / 3600
+        if "tempo_atendimento_s" in comp_df.columns:
+            comp_df["tempo_atendimento_h"] = comp_df["tempo_atendimento_s"] / 3600
+            
+        st.dataframe(comp_df, use_container_width=True)
+        st.download_button("Baixar comparativo (CSV)", data=comp_df.to_csv(index=False).encode("utf-8"), file_name=f"comparativo_mensal_{EMPRESA_PATH_FIXO}.csv")
+        
+        c1, c2 = st.columns(2)
+        with c1:
+            st.plotly_chart(px.line(comp_df, x="mes", y="csat_medio", markers=True, title="Média CSAT geral (Mensal)"), use_container_width=True)
+            st.plotly_chart(px.line(comp_df, x="mes", y="tempo_espera_h", markers=True, title="Média do tempo de espera geral (Mensal)"), use_container_width=True)
+        with c2:
+            st.plotly_chart(px.line(comp_df, x="mes", y="taxa_conclusao", markers=True, title="Porcentagem de atendimentos concluídos (Mensal)"), use_container_width=True)
+            st.plotly_chart(px.bar(comp_df, x="mes", y="total", title="Total de atendimentos recebidos (Mensal)"), use_container_width=True)
+
+# --- 3) Por Canal ---
+# (Este era o código da antiga tabs[1])
+with tabs[2]:
+    st.subheader(f"Indicadores por Canal (Mês: {current_month_key})")
+    
+    # 'cleaned' foi definido na Aba 1 e está disponível aqui
     if "por_canal" not in cleaned:
         st.info("Arquivo 'por canal' não disponível para o mês selecionado.")
     else:
@@ -784,37 +912,108 @@ with tabs[1]:
             dfc["% Concluídos"] = (dfc["Total de atendimentos concluídos"] / dfc["Total de atendimentos"] * 100).fillna(0)
             st.plotly_chart(px.bar(dfc, x="Canal", y="% Concluídos", title="% de atendimentos concluídos por canal"), use_container_width=True)
 
-# --- 3) Comparativo Mensal ---
-with tabs[2]:
-    st.subheader("Comparativo Mensal (KPIs)")
-    
-    with st.spinner(f"Carregando histórico de KPIs para {EMPRESA_NOME_FIXO}..."):
-        comp_df = get_all_kpis()
-    
-    if comp_df.empty:
-        st.info(f"Nenhum dado histórico encontrado para '{EMPRESA_NOME_FIXO}'. Carregue dados de pelo menos um mês.")
-    elif len(comp_df) < 2:
-        st.info("Carregue dados de pelo menos dois meses para habilitar o comparativo.")
-        st.dataframe(comp_df, use_container_width=True)
-    else:
-        if "tempo_espera_s" in comp_df.columns:
-            comp_df["tempo_espera_h"] = comp_df["tempo_espera_s"] / 3600
-        if "tempo_atendimento_s" in comp_df.columns:
-            comp_df["tempo_atendimento_h"] = comp_df["tempo_atendimento_s"] / 3600
-            
-        st.dataframe(comp_df, use_container_width=True)
-        st.download_button("Baixar comparativo (CSV)", data=comp_df.to_csv(index=False).encode("utf-8"), file_name=f"comparativo_mensal_{EMPRESA_PATH_FIXO}.csv")
-        
-        c1, c2 = st.columns(2)
-        with c1:
-            st.plotly_chart(px.line(comp_df, x="mes", y="csat_medio", markers=True, title="Média CSAT geral (Mensal)"), use_container_width=True)
-            st.plotly_chart(px.line(comp_df, x="mes", y="tempo_espera_h", markers=True, title="Média do tempo de espera geral (Mensal)"), use_container_width=True)
-        with c2:
-            st.plotly_chart(px.line(comp_df, x="mes", y="taxa_conclusao", markers=True, title="Porcentagem de atendimentos concluídos (Mensal)"), use_container_width=True)
-            st.plotly_chart(px.bar(comp_df, x="mes", y="total", title="Total de atendimentos recebidos (Mensal)"), use_container_width=True)
-
-# --- 4) Dicionário de Dados ---
+# --- 4) Comparativo Mensal Por Canal ---
+# --- INÍCIO DA NOVA ABA ---
 with tabs[3]:
+    st.subheader("Comparativo Mensal Por Canal")
+
+    with st.spinner(f"Carregando histórico de dados por canal para {EMPRESA_NOME_FIXO}..."):
+        channel_df = get_all_channel_data()
+
+    if channel_df.empty:
+        st.info(f"Nenhum dado histórico 'por canal' encontrado para '{EMPRESA_NOME_FIXO}'.")
+    else:
+        # --- Filtros ---
+        st.markdown("#### Filtros da Aba")
+        
+        # Filtro de Canal
+        all_channels = sorted(channel_df['Canal'].unique())
+        selected_channels = st.multiselect(
+            "Selecione um ou mais canais",
+            options=all_channels,
+            default=all_channels, # Começa com todos selecionados
+            key="multi_channel_filter"
+        )
+        
+        # Filtro de Período
+        all_months = sorted(channel_df['mes'].unique())
+        if len(all_months) > 1:
+            min_month, max_month = st.select_slider(
+                "Selecione o período (Mês/Ano)",
+                options=all_months,
+                value=(all_months[0], all_months[-1]) # Começa com o período completo
+            )
+        else:
+            min_month = all_months[0]
+            max_month = all_months[0]
+
+        # Aplicar filtros
+        filtered_df = channel_df[
+            (channel_df['Canal'].isin(selected_channels)) &
+            (channel_df['mes'] >= min_month) &
+            (channel_df['mes'] <= max_month)
+        ]
+
+        if filtered_df.empty:
+            st.warning("Nenhum dado encontrado para os filtros selecionados.")
+        else:
+            st.markdown("---")
+            
+            # --- Gráficos de Evolução ---
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("##### Evolução da Média CSAT por Canal")
+                fig_csat = px.line(
+                    filtered_df, 
+                    x="mes", 
+                    y="Média CSAT", 
+                    color="Canal",
+                    markers=True,
+                    title="Média CSAT (Mensal)"
+                )
+                fig_csat.update_layout(yaxis_range=[1,5]) # Fixa o eixo de 1 a 5
+                st.plotly_chart(fig_csat, use_container_width=True)
+                
+                st.markdown("##### Evolução da % de Atendimentos Concluídos")
+                fig_pct = px.line(
+                    filtered_df,
+                    x="mes",
+                    y="% Concluídos",
+                    color="Canal",
+                    markers=True,
+                    title="% Concluídos (Mensal)"
+                )
+                fig_pct.update_layout(yaxis_range=[0,100]) # Fixa o eixo de 0 a 100
+                st.plotly_chart(fig_pct, use_container_width=True)
+
+            with col2:
+                st.markdown("##### Evolução do Tempo Médio de Espera (Horas)")
+                fig_tme = px.line(
+                    filtered_df,
+                    x="mes",
+                    y="TME_Horas",
+                    color="Canal",
+                    markers=True,
+                    title="Tempo Médio de Espera (Horas) (Mensal)"
+                )
+                st.plotly_chart(fig_tme, use_container_width=True)
+                
+                st.markdown("##### Volume de Atendimentos por Canal (Mensal)")
+                fig_vol = px.bar(
+                    filtered_df,
+                    x="mes",
+                    y="Total de atendimentos",
+                    color="Canal",
+                    title="Volume de Atendimentos (Mensal)",
+                    barmode="stack" # Empilhado, como solicitado no 'reasoning'
+                )
+                st.plotly_chart(fig_vol, use_container_width=True)
+# --- FIM DA NOVA ABA ---
+
+# --- 5) Dicionário de Dados ---
+# (Este era o código da antiga tabs[3])
+with tabs[4]:
     st.subheader("Dicionário de Dados e SLAs")
     st.markdown("**Arquivos .csv por mês (Padrões de Nome)**")
     
